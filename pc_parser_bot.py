@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# pc_parser_bot.py — ПК-бот слушатель для сбора выручки.
+# V4: 2026-11-16. Токены читаются из .env.telegram (безопасность).
+
 import telebot
 import openpyxl
 import json
@@ -5,17 +9,38 @@ import requests
 import os
 import glob
 import re
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
+from dotenv import load_dotenv
 
-# ================= КОНФИГУРАЦИЯ =================
-PC_TOKEN = "9231662803:AAFntC23FE5FsC2ORDXMwxIDdWR944FARK4"       
-PHONE_TOKEN = "8902601701:AAF9f6VjKRHsUeNgJlINoO3EZmUtiKJvXZ8" 
-CHAT_ID = "285299836"                 
+# === ЗАГРУЗКА СЕКРЕТОВ ===
+# Ищем .env.telegram сначала рядом со скриптом (для Windows .exe), потом в системной папке
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_LOCAL = SCRIPT_DIR / ".env.telegram"
+ENV_GLOBAL = Path.home() / ".config" / "bew" / "secrets" / ".env.telegram"
 
-# Маска файла
+if ENV_LOCAL.exists():
+    load_dotenv(ENV_LOCAL)
+    print(f"[OK] Загружены секреты из {ENV_LOCAL}")
+elif ENV_GLOBAL.exists():
+    load_dotenv(ENV_GLOBAL)
+    print(f"[OK] Загружены секреты из {ENV_GLOBAL}")
+else:
+    print("❌ Ошибка: файл .env.telegram не найден ни рядом со скриптом, ни в ~/.config/bew/secrets/")
+    sys.exit(1)
+
+PC_TOKEN = os.getenv("TELEGRAM_PC_TOKEN")
+PHONE_TOKEN = os.getenv("TELEGRAM_PHONE_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+if not all([PC_TOKEN, PHONE_TOKEN, CHAT_ID]):
+    print("❌ Ошибка: не все токены найдены в .env.telegram (нужны PC_TOKEN, PHONE_TOKEN, CHAT_ID)")
+    sys.exit(1)
+
+# === НАСТРОЙКИ ===
 FILE_NAME_PATTERN = "*ИТОГОВЫЙ ОТЧЁТ ПО ВЫРУЧКЕ*.xlsx"
 
-# Словарь месяцев для распознавания "01.май"
 MONTHS_MAP = {
     "янв": "01", "фев": "02", "мар": "03", "апр": "04", "май": "05", "июн": "06",
     "июл": "07", "авг": "08", "сен": "09", "окт": "10", "ноя": "11", "дек": "12",
@@ -23,7 +48,6 @@ MONTHS_MAP = {
     "июль": "07", "август": "08", "сентябрь": "09", "октябрь": "10", "ноябрь": "11", "декабрь": "12"
 }
 YEAR = "2026"
-# ================================================
 
 bot = telebot.TeleBot(PC_TOKEN)
 
@@ -38,18 +62,20 @@ def find_excel_file():
     for path in search_paths:
         if os.path.exists(path):
             matches = glob.glob(os.path.join(path, FILE_NAME_PATTERN))
-            found_files.extend(matches)
+            for m in matches:
+                # Исключаем временные файлы Excel (начинаются с ~$)
+                if not os.path.basename(m).startswith("~$"):
+                    found_files.append(m)
+                    
     return max(found_files, key=os.path.getctime) if found_files else None
 
 def parse_excel_mo_only(filepath):
-    """Ищет данные строго под шапкой 'Услуги МО'"""
     wb = openpyxl.load_workbook(filepath, data_only=True)
     all_data = {}
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         
-        # 1. Ищем заголовок "Услуги МО"
         mo_row = None
         mo_col = None
         for row_idx, row in enumerate(ws.iter_rows(), start=1):
@@ -60,19 +86,15 @@ def parse_excel_mo_only(filepath):
                     break
             if mo_row: break
         
-        if not mo_row:
-            continue # Если нет "Услуг МО", пропускаем лист
+        if not mo_row: continue
             
-        # 2. Ищем заголовки "Дата" и "Процедуры" в строках ниже надписи "Услуги МО"
         header_row_idx = None
         col_date = None
         col_rev = None
         
-        # Проверяем 3 строки ниже "Услуги МО"
         for check_row in range(mo_row, min(mo_row + 4, ws.max_row + 1)):
             date_c = None
             rev_c = None
-            # Ищем только в пределах 20 колонок от начала "Услуг МО"
             for col_idx in range(mo_col, min(mo_col + 20, ws.max_column + 1)):
                 val = ws.cell(row=check_row, column=col_idx).value
                 if val:
@@ -86,10 +108,8 @@ def parse_excel_mo_only(filepath):
                 col_rev = rev_c
                 break
                 
-        if not header_row_idx:
-            continue # Заголовки не найдены, идем к следующему листу
+        if not header_row_idx: continue
 
-        # 3. Собираем данные из найденных колонок
         for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
             if not row or len(row) < max(col_date, col_rev): continue
             
@@ -97,7 +117,6 @@ def parse_excel_mo_only(filepath):
             rev_val = row[col_rev - 1]
             
             if date_val and rev_val:
-                # Очистка суммы
                 try:
                     if isinstance(rev_val, str):
                         rev_val = float(rev_val.replace(" ", "").replace(",", ".").replace("₽", "").strip())
@@ -106,7 +125,6 @@ def parse_excel_mo_only(filepath):
                 except ValueError:
                     continue 
 
-                # Парсинг даты
                 date_str = None
                 if isinstance(date_val, datetime):
                     date_str = date_val.strftime("%Y-%m-%d")
@@ -122,7 +140,6 @@ def parse_excel_mo_only(filepath):
                         if month:
                             date_str = f"{YEAR}-{month}-{day}"
 
-                # Если дата распознана, суммируем выручку
                 if date_str and len(date_str) == 10:
                     all_data[date_str] = all_data.get(date_str, 0) + rev_val
 
@@ -132,11 +149,13 @@ def send_to_phone(message, data):
     json_path = os.path.join(os.environ.get('TEMP', '.'), "vyruchka_data.json")
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    
     url = f"https://api.telegram.org/bot{PHONE_TOKEN}/sendDocument"
     with open(json_path, 'rb') as f:
         files = {'document': f}
-        payload = {'chat_id': CHAT_ID, 'caption': '📦 Данные о выручке (Только Услуги МО)'}
-        response = requests.post(url, data=payload, files=files)
+        payload = {'chat_id': CHAT_ID, 'caption': '📦 Данные о выручке (Услуги МО)'}
+        response = requests.post(url, data=payload, files=files, timeout=15)
+    
     if response.status_code == 200:
         bot.reply_to(message, "✅ Данные переданы на телефон!")
     else:
@@ -147,18 +166,23 @@ def collect_data(message):
     bot.reply_to(message, "⏳ Принял команду. Ищу файл...")
     excel_path = find_excel_file()
     if not excel_path:
-        bot.reply_to(message, f"❌ Ошибка: Файл '{FILE_NAME_PATTERN}' не найден.")
+        bot.reply_to(message, f"❌ Ошибка: Файл '{FILE_NAME_PATTERN}' не найден на Рабочем столе, в Загрузках или Документах.")
         return
-    bot.reply_to(message, f"📄 Найден: {os.path.basename(excel_path)}\nИщу данные только по Услугам МО...")
+
+    bot.reply_to(message, f"📄 Найден: {os.path.basename(excel_path)}\nПарсим...")
+
     try:
         data = parse_excel_mo_only(excel_path)
         if not data:
             bot.reply_to(message, "⚠️ Данные не найдены. Убедитесь, что есть блок 'Услуги МО' с колонками 'Дата' и 'Процедуры'.")
             return
         send_to_phone(message, data)
+        
+    except PermissionError:
+        bot.reply_to(message, "⚠️ Файл заблокирован (открыт в Excel). Пожалуйста, закройте его на компьютере и попробуйте снова.")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка парсинга: {e}")
 
 if __name__ == '__main__':
-    print("ПК-парсер запущен (Только Услуги МО)...")
+    print("ПК-парсер запущен (Только Услуги МО, токены из .env)...")
     bot.polling(non_stop=True)
